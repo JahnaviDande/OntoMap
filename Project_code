@@ -1,0 +1,253 @@
+
+import pandas as pd
+import numpy as np
+import torch
+from torch_geometric.nn import GCNConv
+import torch.nn.functional as F
+import random
+import matplotlib.pyplot as plt
+
+# -------------------------
+# 0) SEED
+# -------------------------
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+# -------------------------
+# 1) LOAD DATA (FIXED)
+# -------------------------
+edges = pd.read_csv("/content/Sample_dataset_single_drug_per_row.csv")
+diseases = pd.read_csv("/content/Indian Rare Diseases.xlsx - Sheet1.csv")
+drugs = pd.read_csv("/content/drugsInfo.csv")
+
+# Rename edge columns to standard names
+edges = edges.rename(columns={
+    "Available Drug IDs": "DrugID",
+    "ORPHAcode": "DiseaseID"
+})
+
+# Ensure string dtype
+edges['DrugID'] = edges['DrugID'].astype(str)
+edges['DiseaseID'] = edges['DiseaseID'].astype(str)
+drugs['DrugID'] = drugs['DrugID'].astype(str)
+diseases['ORPHAcode'] = diseases['ORPHAcode'].astype(str)
+
+# -------------------------
+# 2) NODE LIST & INDEX
+# -------------------------
+drug_ids = edges['DrugID'].unique()
+disease_ids = edges['DiseaseID'].unique()
+
+all_nodes = list(drug_ids) + list(disease_ids)
+node_to_idx = {n: i for i, n in enumerate(all_nodes)}
+idx_to_node = {i: n for n, i in node_to_idx.items()}
+
+# -------------------------
+# 3) EDGE INDEX
+# -------------------------
+edge_index = torch.tensor([
+    [node_to_idx[d] for d in edges['DrugID']],
+    [node_to_idx[d] for d in edges['DiseaseID']]
+], dtype=torch.long)
+
+# -------------------------
+# 4) DRUG FEATURES (CATEGORIES)
+# -------------------------
+if 'DrugCategories' in drugs.columns:
+    cat_dummies = drugs['DrugCategories'].fillna("Unknown").str.get_dummies(sep=';')
+else:
+    cat_dummies = pd.DataFrame(np.zeros((len(drugs), 1)))
+
+cat_dummies.index = drugs['DrugID']
+
+drug_feats = []
+for d in drug_ids:
+    if d in cat_dummies.index:
+        drug_feats.append(cat_dummies.loc[d].values)
+    else:
+        drug_feats.append(np.zeros(cat_dummies.shape[1]))
+
+drug_feats = np.array(drug_feats)
+
+# Disease features = zeros
+disease_feats = np.zeros((len(disease_ids), drug_feats.shape[1]))
+
+# Node feature matrix
+x = torch.tensor(
+    np.vstack([drug_feats, disease_feats]),
+    dtype=torch.float
+)
+
+# -------------------------
+# 5) NEGATIVE SAMPLING
+# -------------------------
+drug_idx = [node_to_idx[d] for d in drug_ids]
+disease_idx = [node_to_idx[d] for d in disease_ids]
+
+pos_edges = set(zip(edge_index[0].tolist(), edge_index[1].tolist()))
+num_neg = edge_index.size(1)
+
+neg_edges = set()
+while len(neg_edges) < num_neg:
+    pair = (random.choice(drug_idx), random.choice(disease_idx))
+    if pair not in pos_edges:
+        neg_edges.add(pair)
+
+neg_edge_index = torch.tensor(list(neg_edges), dtype=torch.long).t()
+
+train_edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
+y = torch.cat([
+    torch.ones(edge_index.size(1)),
+    torch.zeros(neg_edge_index.size(1))
+]).long()
+
+# -------------------------
+# 6) GNN MODEL
+# -------------------------
+class SimpleGNN(torch.nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.conv1 = GCNConv(in_dim, 16)
+        self.conv2 = GCNConv(16, 8)
+        self.lin = torch.nn.Linear(16, 2)
+
+    def forward(self, x, edge_index, pairs):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        src, dst = x[pairs[0]], x[pairs[1]]
+        return self.lin(torch.cat([src, dst], dim=1)), x
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = SimpleGNN(x.shape[1]).to(device)
+
+x = x.to(device)
+edge_index = edge_index.to(device)
+train_edge_index = train_edge_index.to(device)
+y = y.to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+criterion = torch.nn.CrossEntropyLoss()
+
+# -------------------------
+# 7) TRAIN
+# -------------------------
+for epoch in range(60):
+    model.train()
+    optimizer.zero_grad()
+    logits, _ = model(x, edge_index, train_edge_index)
+    loss = criterion(logits, y)
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 10 == 0:
+        acc = (logits.argmax(1) == y).float().mean().item()
+        print(f"Epoch {epoch:02d} | Loss {loss:.4f} | Acc {acc:.3f}")
+
+# -------------------------
+# 8) CANDIDATE PAIRS
+# -------------------------
+known_pairs = set(zip(edges.DrugID, edges.DiseaseID))
+
+candidates, pairs_idx = [], []
+for d in drug_ids:
+    for dis in disease_ids:
+        if (d, dis) not in known_pairs:
+            candidates.append((d, dis))
+            pairs_idx.append((node_to_idx[d], node_to_idx[dis]))
+
+# GNN inference
+model.eval()
+gnn_probs = []
+with torch.no_grad():
+    for i in range(0, len(pairs_idx), 4096):
+        batch = torch.tensor(pairs_idx[i:i+4096]).t().to(device)
+        out, _ = model(x, edge_index, batch)
+        gnn_probs.extend(torch.softmax(out, 1)[:,1].cpu().numpy())
+
+# -------------------------
+# 9) CATEGORY SIMILARITY
+# -------------------------
+def parse_cats(s):
+    if pd.isna(s):
+        return set()
+    s = str(s).lower().strip()
+    if ';' in s:
+        parts = s.split(';')
+    elif ',' in s:
+        parts = s.split(',')
+    else:
+        parts = [s]
+    return set(p.strip() for p in parts if p.strip())
+
+
+drug_cats = {
+    r.DrugID: parse_cats(r.DrugCategories)
+    for _, r in drugs.iterrows()
+}
+
+disease_known_drugs = edges.groupby("DiseaseID")['DrugID'].apply(list).to_dict()
+
+def jaccard(a, b):
+    if not a and not b:
+        return 0.0
+    if not a or not b:
+        return 0.05   # smoothing term
+    return len(a & b) / len(a | b)
+
+
+cat_sims = []
+for d, dis in candidates:
+    sims = [
+        jaccard(drug_cats.get(d, set()), drug_cats.get(kd, set()))
+        for kd in disease_known_drugs.get(dis, [])
+    ]
+    cat_sims.append(max(sims) if sims else 0.0)
+
+
+# -------------------------
+# 10) LATE FUSION
+# -------------------------
+final_scores = 0.8*np.array(gnn_probs) + 0.2*np.array(cat_sims)
+
+# -------------------------
+# 11) OUTPUT
+# -------------------------
+out = pd.DataFrame(candidates, columns=["DrugID", "DiseaseID"])
+out["gnn_prob"] = gnn_probs
+out["cat_sim"] = cat_sims
+out["final_score"] = final_scores
+
+drug_name_map = dict(zip(drugs.DrugID, drugs.DrugName))
+disease_name_map = dict(
+    zip(diseases['ORPHAcode'], diseases['Original name (your list)'])
+)
+
+
+out["DrugName"] = out.DrugID.map(drug_name_map)
+out["DiseaseName"] = out.DiseaseID.map(disease_name_map)
+
+out["KnownDrugsForDisease"] = out.DiseaseID.map(
+    lambda d: "; ".join(drug_name_map.get(k, k) for k in disease_known_drugs.get(d, []))
+)
+
+out = out.sort_values("final_score", ascending=False)
+out.to_csv("category_fusion_new_predictions.csv", index=False)
+
+print("Saved category_fusion_new_predictions.csv")
+
+# -------------------------
+# 12) PLOT
+# -------------------------
+topk = out.head(20)
+
+plt.figure(figsize=(10, 8))
+plt.barh(
+    topk.DrugName + " → " + topk.DiseaseName,
+    topk.final_score
+)
+plt.gca().invert_yaxis()
+plt.xlabel("Final Score")
+plt.title("Top 20 Drug–Disease Repurposing Predictions")
+plt.show()
